@@ -164,15 +164,6 @@ public class ProxySocketServer {
             while (remaining > 0) {
                 int n = originIn.read(buf, 0, (int) Math.min(buf.length, remaining));
                 if (n < 0) break;
-		try{
-		    Thread.sleep(2000);
-		    // can you push for the minimum required to
-		    // mainain good buffering and playout delay maintaining
-		    // a good vizualization-playing experience ?
-		} catch (InterruptedException e) {
-		    System.out.println("uppps");
-		}
-		    
                 browserOut.write(buf, 0, n);
                 browserOut.flush();
                 remaining -= n;
