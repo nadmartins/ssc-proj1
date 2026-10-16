@@ -1,12 +1,20 @@
+package streamserver;
+
+import common.CryptoConfig;
+import common.CryptoService;
+import common.ProtocolMessage;
+import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.security.MessageDigest;
+import java.util.Arrays;
 import java.util.concurrent.Executors;
 
 /**
@@ -21,10 +29,14 @@ import java.util.concurrent.Executors;
 public class StreamServer {
 
     static final int BLOCK_SIZE = 1024;
+    private static CryptoConfig serverConfig;
 
     public static void main(String[] args) throws Exception {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : 8081;
         Path root = Paths.get(args.length > 1 ? args[1] : "media").toAbsolutePath().normalize();
+        String configFile = args.length > 2 ? args[2] : "sservercrypto.config";
+
+        serverConfig = CryptoConfig.load(configFile);
 
         try (ServerSocket server = new ServerSocket(port)) {
             System.out.println("Origin server on http://localhost:" + port + "/media/<file.mp4>  (dir: " + root + ")");
@@ -38,103 +50,82 @@ public class StreamServer {
 
     static void handle(Socket socket, Path root) {
         try (socket) {
-            var in = socket.getInputStream();
-            var out = socket.getOutputStream();
-
-            String requestLine = HttpUtil.readLine(in);
-            if (requestLine == null || !requestLine.startsWith("GET ")) {
-                writeStatus(out, 400, "Bad Request", 0);
+            InputStream in = socket.getInputStream();
+            OutputStream out = socket.getOutputStream();
+            ProtocolMessage msg1 = ProtocolMessage.read(in);
+            if (msg1 == null || msg1.getType() != ProtocolMessage.TYPE_1_PROXY_PROPOSAL) {
+                sendErrorAndClose(out, "Expected Type 1 message.");
                 return;
             }
-            String path = requestLine.split(" ")[1];
-
-            String rangeHeader = null;
-            String line;
-            while ((line = HttpUtil.readLine(in)) != null && !line.isEmpty()) {
-                int c = line.indexOf(':');
-                if (c > 0 && line.substring(0, c).equalsIgnoreCase("Range")) {
-                    rangeHeader = line.substring(c + 1).trim();
-                }
-            }
-
-            if (!path.startsWith("/media/")) {
-                writeStatus(out, 404, "Not Found", 0);
+            ProtocolMessage.Type1Data type1 = msg1.parseType1();
+            System.out.println("[Handshake] Received Type 1 proposal from Proxy: PCC = " + type1.pcc());
+            if (!type1.pcc().equalsIgnoreCase(serverConfig.toPcc())) {
+                System.err.println("[Handshake] Rejected proposal: " + type1.pcc());
+                sendErrorAndClose(out, "Proposed cryptographic configuration rejected.");
                 return;
             }
-            String name = path.substring("/media/".length());
-            Path file = root.resolve(name).normalize();
+            long seqY = type1.secx() + 1;
+            byte[] srv = CryptoService.generateNonce(32); // 256-bit secure challenge nonce
+            String ccc = serverConfig.toPcc();
+            ProtocolMessage msg2 = ProtocolMessage.createType2(seqY, srv, ccc, serverConfig);
+            msg2.send(out);
+            System.out.println("[Handshake] Sent Type 2 message with 256-bit SRV challenge.");
+            ProtocolMessage msg3 = ProtocolMessage.read(in);
+            if (msg3 == null || msg3.getType() != ProtocolMessage.TYPE_3_PROXY_REQUEST) {
+                sendErrorAndClose(out, "Expected Type 3 message.");
+                return;
+            }
+            ProtocolMessage.Type3Data type3 = msg3.parseType3(serverConfig);
+            if (type3.seqz() != seqY + 1) {
+                sendErrorAndClose(out, "Invalid sequence number in Type 3 message.");
+                return;
+            }
+            byte[] expectedR = CryptoService.sha256(srv);
+            if (!MessageDigest.isEqual(expectedR, type3.r())) {
+                sendErrorAndClose(out, "Invalid SRV challenge response!");
+                return;
+            }
+            System.out.println("[Handshake] Handshake completed successfully! Requested media: " + type3.media());
+
+            Path file = root.resolve(type3.media()).normalize();
             if (!file.startsWith(root) || !Files.isRegularFile(file)) {
-                writeStatus(out, 404, "Not Found", 0);
+                sendErrorAndClose(out, "Media file not found: " + type3.media());
                 return;
             }
-
-            serveFile(out, file, rangeHeader);
-        } catch (IOException e) {
-            // Client (the proxy) disconnected mid-stream: normal on seek/close, nothing to do.
+            serveFile(out, file, type3.seqz());
+        } catch (Exception e) {
+            System.err.println("Session error with client: " + e.getMessage());
         }
     }
 
-    static void serveFile(OutputStream out, Path file, String rangeHeader) throws IOException {
+    static void serveFile(OutputStream out, Path file, long lastSeqZ) throws Exception {
         long size = Files.size(file);
-        long start = 0, end = size - 1;
-        boolean partial = false;
-
-        if (rangeHeader != null && rangeHeader.startsWith("bytes=") && !rangeHeader.contains(",")) {
-            try {
-                String[] p = rangeHeader.substring(6).trim().split("-", -1);
-                long s, e = end;
-                if (p[0].isEmpty()) {
-                    s = Math.max(0, size - Long.parseLong(p[1]));
-                } else {
-                    s = Long.parseLong(p[0]);
-                    if (p.length > 1 && !p[1].isEmpty()) e = Math.min(Long.parseLong(p[1]), size - 1);
-                }
-                if (s > e || s >= size) {
-                    writeHeaders(out, 416, "Range Not Satisfiable", 0, null,
-                            "Content-Range: bytes */" + size + "\r\n");
-                    return;
-                }
-                start = s;
-                end = e;
-                partial = true;
-            } catch (NumberFormatException | ArrayIndexOutOfBoundsException ignored) {
-                // Malformed Range -> fall through and serve the whole file
-            }
-        }
-
-        long length = end - start + 1;
-        String extraHeaders = "Accept-Ranges: bytes\r\n" +
-                (partial ? "Content-Range: bytes " + start + "-" + end + "/" + size + "\r\n" : "");
-        writeHeaders(out, partial ? 206 : 200, partial ? "Partial Content" : "OK", length, "video/mp4", extraHeaders);
-
+        long seqB = lastSeqZ + 1;
+        System.out.println("[Streaming] Starting encrypted streaming of " + file.getFileName() + " (" + size + " bytes)");
         try (RandomAccessFile raf = new RandomAccessFile(file.toFile(), "r")) {
-            raf.seek(start);
             byte[] block = new byte[BLOCK_SIZE];
-            long remaining = length;
+            long remaining = size;
+            long blockCount = 0;
             while (remaining > 0) {
                 int n = raf.read(block, 0, (int) Math.min(block.length, remaining));
                 if (n < 0) break;
-                out.write(block, 0, n);
-                out.flush();
+                byte[] chunk = (n == block.length) ? block : Arrays.copyOf(block, n);
+                ProtocolMessage msg4 = ProtocolMessage.createType4(seqB, chunk, serverConfig);
+                msg4.send(out);
                 remaining -= n;
+                seqB++;
+                blockCount++;
             }
+            ProtocolMessage msg5 = ProtocolMessage.createType5(seqB, "STREAM_FINISHED", serverConfig);
+            msg5.send(out);
+            System.out.println("[Streaming] Completed successfully. Total encrypted blocks sent: " + blockCount);
         }
     }
-
-    static void writeStatus(OutputStream out, int code, String reason, long contentLength) throws IOException {
-        writeHeaders(out, code, reason, contentLength, null, null);
-    }
-
-    static void writeHeaders(OutputStream out, int code, String reason, long contentLength,
-                              String contentType, String extraHeaders) throws IOException {
-        StringBuilder sb = new StringBuilder();
-        sb.append("HTTP/1.1 ").append(code).append(' ').append(reason).append("\r\n");
-        if (contentType != null) sb.append("Content-Type: ").append(contentType).append("\r\n");
-        sb.append("Content-Length: ").append(contentLength).append("\r\n");
-        sb.append("Connection: close\r\n");
-        if (extraHeaders != null) sb.append(extraHeaders);
-        sb.append("\r\n");
-        out.write(sb.toString().getBytes(StandardCharsets.US_ASCII));
-        out.flush();
+    static void sendErrorAndClose(OutputStream out, String reason) {
+        try {
+            System.err.println("[Protocol Error] " + reason);
+            ProtocolMessage err = ProtocolMessage.createError(reason);
+            err.send(out);
+        } catch (IOException ignored) {}
     }
 }
