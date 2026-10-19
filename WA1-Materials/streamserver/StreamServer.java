@@ -27,19 +27,15 @@ import java.util.concurrent.Executors;
  * Usage: java OriginSocketServer [port=8081] [mediaDir=media]
  */
 public class StreamServer {
-
     static final int BLOCK_SIZE = 1024;
     private static CryptoConfig serverConfig;
-
     public static void main(String[] args) throws Exception {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : 8081;
         Path root = Paths.get(args.length > 1 ? args[1] : "media").toAbsolutePath().normalize();
         String configFile = args.length > 2 ? args[2] : "sservercrypto.config";
-
         serverConfig = CryptoConfig.load(configFile);
-
+        System.out.println("Secure Stream Server on port " + port + " [" + serverConfig.toPcc() + "]");
         try (ServerSocket server = new ServerSocket(port)) {
-            System.out.println("Origin server on http://localhost:" + port + "/media/<file.mp4>  (dir: " + root + ")");
             var pool = Executors.newCachedThreadPool();
             while (true) {
                 Socket client = server.accept();
@@ -47,7 +43,6 @@ public class StreamServer {
             }
         }
     }
-
     static void handle(Socket socket, Path root) {
         try (socket) {
             InputStream in = socket.getInputStream();
@@ -58,18 +53,15 @@ public class StreamServer {
                 return;
             }
             ProtocolMessage.Type1Data type1 = msg1.parseType1();
-            System.out.println("[Handshake] Received Type 1 proposal from Proxy: PCC = " + type1.pcc());
             if (!type1.pcc().equalsIgnoreCase(serverConfig.toPcc())) {
-                System.err.println("[Handshake] Rejected proposal: " + type1.pcc());
                 sendErrorAndClose(out, "Proposed cryptographic configuration rejected.");
                 return;
             }
             long seqY = type1.secx() + 1;
-            byte[] srv = CryptoService.generateNonce(32); // 256-bit secure challenge nonce
+            byte[] srv = CryptoService.generateNonce(32);
             String ccc = serverConfig.toPcc();
             ProtocolMessage msg2 = ProtocolMessage.createType2(seqY, srv, ccc, serverConfig);
             msg2.send(out);
-            System.out.println("[Handshake] Sent Type 2 message with 256-bit SRV challenge.");
             ProtocolMessage msg3 = ProtocolMessage.read(in);
             if (msg3 == null || msg3.getType() != ProtocolMessage.TYPE_3_PROXY_REQUEST) {
                 sendErrorAndClose(out, "Expected Type 3 message.");
@@ -82,30 +74,26 @@ public class StreamServer {
             }
             byte[] expectedR = CryptoService.sha256(srv);
             if (!MessageDigest.isEqual(expectedR, type3.r())) {
-                sendErrorAndClose(out, "Invalid SRV challenge response!");
+                sendErrorAndClose(out, "Invalid SRV challenge response.");
                 return;
             }
-            System.out.println("[Handshake] Handshake completed successfully! Requested media: " + type3.media());
-
             Path file = root.resolve(type3.media()).normalize();
             if (!file.startsWith(root) || !Files.isRegularFile(file)) {
                 sendErrorAndClose(out, "Media file not found: " + type3.media());
                 return;
             }
+            System.out.println("Streaming '" + type3.media() + "' to client");
             serveFile(out, file, type3.seqz());
         } catch (Exception e) {
-            System.err.println("Session error with client: " + e.getMessage());
+            System.err.println("Session error: " + e.getMessage());
         }
     }
-
     static void serveFile(OutputStream out, Path file, long lastSeqZ) throws Exception {
         long size = Files.size(file);
         long seqB = lastSeqZ + 1;
-        System.out.println("[Streaming] Starting encrypted streaming of " + file.getFileName() + " (" + size + " bytes)");
         try (RandomAccessFile raf = new RandomAccessFile(file.toFile(), "r")) {
             byte[] block = new byte[BLOCK_SIZE];
             long remaining = size;
-            long blockCount = 0;
             while (remaining > 0) {
                 int n = raf.read(block, 0, (int) Math.min(block.length, remaining));
                 if (n < 0) break;
@@ -114,16 +102,14 @@ public class StreamServer {
                 msg4.send(out);
                 remaining -= n;
                 seqB++;
-                blockCount++;
             }
             ProtocolMessage msg5 = ProtocolMessage.createType5(seqB, "STREAM_FINISHED", serverConfig);
             msg5.send(out);
-            System.out.println("[Streaming] Completed successfully. Total encrypted blocks sent: " + blockCount);
         }
     }
     static void sendErrorAndClose(OutputStream out, String reason) {
         try {
-            System.err.println("[Protocol Error] " + reason);
+            System.err.println("Protocol error: " + reason);
             ProtocolMessage err = ProtocolMessage.createError(reason);
             err.send(out);
         } catch (IOException ignored) {}

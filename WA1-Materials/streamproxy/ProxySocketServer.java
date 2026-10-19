@@ -1,13 +1,15 @@
 package streamproxy;
-
+import common.CryptoConfig;
+import common.CryptoService;
+import common.ProtocolMessage;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.util.concurrent.Executors;
-import java.lang.Thread;
 
 /**
  * Proxy implemented with raw sockets only (java.net.ServerSocket / Socket), no
@@ -20,9 +22,9 @@ import java.lang.Thread;
  * Usage: java ProxySocketServer [port=8080] [originHost=localhost] [originPort=8081]
  */
 public class ProxySocketServer {
-
     static final int BLOCK_SIZE = 1024;
-
+    private static CryptoConfig proxyConfig;
+    private static final SecureRandom RANDOM = new SecureRandom();
     static final String INDEX_HTML = """
             <!doctype html>
             <html><head><meta charset="utf-8"><title>MP4 via socket-only proxy</title></head>
@@ -41,14 +43,14 @@ public class ProxySocketServer {
               </script>
             </body></html>
             """;
-
     public static void main(String[] args) throws Exception {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : 8080;
         String originHost = args.length > 1 ? args[1] : "localhost";
         int originPort = args.length > 2 ? Integer.parseInt(args[2]) : 8081;
-
+        String configFile = args.length > 3 ? args[3] : "proxycrypto.config";
+        proxyConfig = CryptoConfig.load(configFile);
+        System.out.println("Proxy on http://localhost:" + port + "/  ->  http://" + originHost + ":" + originPort);
         try (ServerSocket server = new ServerSocket(port)) {
-            System.out.println("Proxy on http://localhost:" + port + "/  ->  http://" + originHost + ":" + originPort);
             var pool = Executors.newCachedThreadPool();
             while (true) {
                 Socket client = server.accept();
@@ -56,28 +58,20 @@ public class ProxySocketServer {
             }
         }
     }
-
     static void handle(Socket browser, String originHost, int originPort) {
         try (browser) {
             InputStream in = browser.getInputStream();
             OutputStream out = browser.getOutputStream();
-
             String requestLine = HttpUtil.readLine(in);
             if (requestLine == null || !requestLine.startsWith("GET ")) {
                 writeSimpleStatus(out, 400, "Bad Request");
                 return;
             }
             String path = requestLine.split(" ")[1];
-
-            String rangeHeader = null;
             String line;
             while ((line = HttpUtil.readLine(in)) != null && !line.isEmpty()) {
-                int c = line.indexOf(':');
-                if (c > 0 && line.substring(0, c).equalsIgnoreCase("Range")) {
-                    rangeHeader = line.substring(c + 1).trim();
-                }
+                // Drain headers
             }
-
             if (path.equals("/") || path.isEmpty()) {
                 servePage(out);
                 return;
@@ -86,15 +80,11 @@ public class ProxySocketServer {
                 writeSimpleStatus(out, 404, "Not Found");
                 return;
             }
-
-            String name = path.substring("/video/".length());
-            relayFromOrigin(out, originHost, originPort, name, rangeHeader);
-
-        } catch (IOException e) {
-            // Browser disconnected or origin unreachable mid-stream: nothing to do.
+            String mediaName = path.substring("/video/".length());
+            relaySecureStream(out, originHost, originPort, mediaName);
+        } catch (IOException ignored) {
         }
     }
-
     static void servePage(OutputStream out) throws IOException {
         byte[] page = INDEX_HTML.getBytes(StandardCharsets.UTF_8);
         StringBuilder headers = new StringBuilder();
@@ -106,73 +96,69 @@ public class ProxySocketServer {
         out.write(page);
         out.flush();
     }
-
-    static void relayFromOrigin(OutputStream browserOut, String originHost, int originPort,
-                                 String name, String rangeHeader) throws IOException {
+    static void relaySecureStream(OutputStream browserOut, String originHost, int originPort, String mediaName) {
+        long startTime = System.currentTimeMillis();
+        long encryptedBlocksReceived = 0;
+        long decryptedBlocksForwarded = 0;
+        long totalBytesProcessed = 0;
         try (Socket origin = new Socket(originHost, originPort)) {
             OutputStream originOut = origin.getOutputStream();
             InputStream originIn = origin.getInputStream();
-
-            StringBuilder req = new StringBuilder();
-            req.append("GET /media/").append(name).append(" HTTP/1.1\r\n")
-                    .append("Host: ").append(originHost).append(":").append(originPort).append("\r\n");
-            if (rangeHeader != null) req.append("Range: ").append(rangeHeader).append("\r\n");
-            req.append("Connection: close\r\n\r\n");
-            originOut.write(req.toString().getBytes(StandardCharsets.US_ASCII));
-            originOut.flush();
-
-            // Parse the origin's status line + headers
-            String statusLine = HttpUtil.readLine(originIn);
-            if (statusLine == null) {
+            long secX = RANDOM.nextLong() & 0x7FFFFFFFFFFFFFFFL;
+            ProtocolMessage msg1 = ProtocolMessage.createType1(secX, proxyConfig.toPcc());
+            msg1.send(originOut);
+            ProtocolMessage msg2 = ProtocolMessage.read(originIn);
+            if (msg2 == null || msg2.getType() != ProtocolMessage.TYPE_2_SERVER_CHALLENGE) {
                 writeSimpleStatus(browserOut, 502, "Bad Gateway");
                 return;
             }
-            String[] parts = statusLine.split(" ", 3);
-            int code = Integer.parseInt(parts[1]);
-            String reason = parts.length > 2 ? parts[2] : "";
-
-            long contentLength = -1;
-            String contentType = null, contentRange = null, acceptRanges = null;
-            String line;
-            while ((line = HttpUtil.readLine(originIn)) != null && !line.isEmpty()) {
-                int c = line.indexOf(':');
-                if (c <= 0) continue;
-                String h = line.substring(0, c).trim();
-                String v = line.substring(c + 1).trim();
-                switch (h.toLowerCase()) {
-                    case "content-length" -> contentLength = Long.parseLong(v);
-                    case "content-type" -> contentType = v;
-                    case "content-range" -> contentRange = v;
-                    case "accept-ranges" -> acceptRanges = v;
+            ProtocolMessage.Type2Data type2 = msg2.parseType2(proxyConfig);
+            if (type2.seqy() != secX + 1) {
+                writeSimpleStatus(browserOut, 502, "Bad Gateway");
+                return;
+            }
+            byte[] responseR = CryptoService.sha256(type2.srv());
+            long seqZ = type2.seqy() + 1;
+            ProtocolMessage msg3 = ProtocolMessage.createType3(seqZ, responseR, mediaName, proxyConfig);
+            msg3.send(originOut);
+            String httpHeader = "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nConnection: close\r\n\r\n";
+            browserOut.write(httpHeader.getBytes(StandardCharsets.US_ASCII));
+            browserOut.flush();
+            long expectedSeq = seqZ + 1;
+            while (true) {
+                ProtocolMessage streamMsg = ProtocolMessage.read(originIn);
+                if (streamMsg == null) break;
+                if (streamMsg.getType() == ProtocolMessage.TYPE_4_STREAM_BLOCK) {
+                    encryptedBlocksReceived++;
+                    ProtocolMessage.Type4Data type4 = streamMsg.parseType4(proxyConfig);
+                    if (type4.seqb() != expectedSeq) {
+                        break;
+                    }
+                    browserOut.write(type4.videoBlock());
+                    browserOut.flush();
+                    decryptedBlocksForwarded++;
+                    totalBytesProcessed += type4.videoBlock().length;
+                    expectedSeq++;
+                } else if (streamMsg.getType() == ProtocolMessage.TYPE_5_STREAM_END) {
+                    break;
+                } else if (streamMsg.getType() == ProtocolMessage.TYPE_ERROR) {
+                    break;
                 }
             }
-
-            // Forward status + the headers the browser needs for playback/seeking
-            StringBuilder resp = new StringBuilder();
-            resp.append("HTTP/1.1 ").append(code).append(' ').append(reason).append("\r\n");
-            if (contentType != null) resp.append("Content-Type: ").append(contentType).append("\r\n");
-            if (acceptRanges != null) resp.append("Accept-Ranges: ").append(acceptRanges).append("\r\n");
-            if (contentRange != null) resp.append("Content-Range: ").append(contentRange).append("\r\n");
-            if (contentLength >= 0) resp.append("Content-Length: ").append(contentLength).append("\r\n");
-            resp.append("Connection: close\r\n\r\n");
-            browserOut.write(resp.toString().getBytes(StandardCharsets.US_ASCII));
-            browserOut.flush();
-
-            if (contentLength <= 0) return;
-
-            // Relay the body block by block; closing either socket cancels the transfer.
-            byte[] buf = new byte[BLOCK_SIZE];
-            long remaining = contentLength;
-            while (remaining > 0) {
-                int n = originIn.read(buf, 0, (int) Math.min(buf.length, remaining));
-                if (n < 0) break;
-                browserOut.write(buf, 0, n);
-                browserOut.flush();
-                remaining -= n;
-            }
+            printMetrics(encryptedBlocksReceived, decryptedBlocksForwarded, totalBytesProcessed, startTime);
+        } catch (Exception e) {
+            System.err.println("Error: " + e.getMessage());
         }
     }
-
+    private static void printMetrics(long received, long forwarded, long bytesProcessed, long startTime) {
+        long durationMs = Math.max(1, System.currentTimeMillis() - startTime);
+        double seconds = durationMs / 1000.0;
+        double throughputKB = (bytesProcessed / 1024.0) / seconds;
+        System.out.println("Number of encrypted blocks received: " + received);
+        System.out.println("Number of decrypted blocks forwarded: " + forwarded);
+        System.out.printf("Observed stream throughput: %.2f kB/s\n", throughputKB);
+        System.out.println("Total volume of processed data: " + bytesProcessed + " bytes");
+    }
     static void writeSimpleStatus(OutputStream out, int code, String reason) throws IOException {
         String resp = "HTTP/1.1 " + code + " " + reason + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         out.write(resp.getBytes(StandardCharsets.US_ASCII));
