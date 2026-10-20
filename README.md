@@ -22,3 +22,25 @@ java StreamServer
 cd .\WA1-Materials\streamproxy\
 java StreamProxy
 ```
+
+## Supported ciphers
+
+### Algorithms:
+AES
+
+ChaCha20
+
+RC6
+
+### Modes:
+GCM
+
+ECB
+
+CTR
+
+CBC
+
+CCM
+
+Poly1305
