@@ -8,14 +8,18 @@ import javax.crypto.Cipher;
 import javax.crypto.Mac;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.IvParameterSpec;
-
+import java.security.Security;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
 public class CryptoService {
+
+    static {
+        Security.addProvider(new BouncyCastleProvider());
+    }
 
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final int AEAD_NONCE_LENGTH = 12;
     private static final int GCM_TAG_LENGTH = 128;
-
 
     public static byte[] encrypt(byte[] plaintext, CryptoConfig config) throws Exception {
         if (config.isAead()) {
