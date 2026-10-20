@@ -106,7 +106,10 @@ public class CryptoConfig {
 
     public String getTransformation() {
         String pad = (padding == null || padding.equalsIgnoreCase("NULL")) ? "NoPadding" : padding;
-        return algorithm + "/" + mode + "/" + pad;
+        if (algorithm.equalsIgnoreCase("ChaCha20") && mode.equalsIgnoreCase("Poly1305"))
+            return "ChaCha20-Poly1305";
+        else
+            return algorithm + "/" + mode + "/" + pad;
     }
 
 
