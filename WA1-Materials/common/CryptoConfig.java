@@ -111,7 +111,7 @@ public class CryptoConfig {
 
 
     public boolean isAead() {
-        return "GCM".equalsIgnoreCase(mode) || "CCM".equalsIgnoreCase(mode) || "Poly1305".equalsIgnoreCase(mode);
+        return "GCM".equalsIgnoreCase(mode) || "CCM".equalsIgnoreCase(mode) || "ChaCha20-Poly1305".equalsIgnoreCase(algorithm);
     }
 
     public SecretKey getSecretKey() {
